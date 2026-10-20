@@ -22,6 +22,21 @@ pub enum Error {
     #[error("request timed out")]
     Timeout,
 
+    /// The API ran the request in the background, like a large `copy_from_namespace`, and it was still running
+    /// when the request's timeout ran out. The operation carries on.
+    ///
+    /// For a copy, check on it with [`Namespace::poll_copy_from`](crate::Namespace::poll_copy_from) and `token`,
+    /// rather than sending the request again, which would start another copy. Other operations, like recall
+    /// evaluations, can't be checked on with this SDK, and `poll_copy_from` can't decode their results: send those
+    /// again with a longer timeout.
+    #[error("request timed out while operation {token} was still running")]
+    OperationTimeout {
+        /// The operation's token.
+        token: String,
+        /// The URL of the operation's status.
+        location: String,
+    },
+
     /// The request couldn't be sent or its response couldn't be read (after exhausting any retries).
     #[error("connection error")]
     Connection(#[source] reqwest::Error),
@@ -69,9 +84,9 @@ impl Error {
         }
     }
 
-    /// Whether this is a timeout.
+    /// Whether this is a timeout, including an [`Error::OperationTimeout`].
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Timeout)
+        matches!(self, Self::Timeout | Self::OperationTimeout { .. })
     }
 
     /// Whether the request might succeed if it's tried again: timeouts, connection errors, and the API errors the

@@ -4,9 +4,9 @@
 //! Every request asks the API to respond asynchronously with `prefer: respond-async`, which it may do for
 //! long-running operations like `copy_from_namespace` and recall evaluation. It then responds with
 //! `202 Accepted` and a `location` to poll, which the client does until the operation finishes, returning its
-//! result as if the request had been synchronous. Polling stops with [`Error::Timeout`] once the request's
-//! timeout runs out, but the operation carries on in the background. Setting a `prefer` header on a request or
-//! client opts out.
+//! result as if the request had been synchronous. Polling stops with [`Error::OperationTimeout`] once the
+//! request's timeout runs out, but the operation carries on in the background, and the error has its token (see
+//! there for checking on it). Setting a `prefer` header on a request or client opts out.
 //!
 //! See <https://turbopuffer.com/docs/api-overview#asynchronous-requests>.
 
@@ -62,14 +62,23 @@ impl Client {
             .options
             .max_retries
             .unwrap_or(self.inner.max_retries);
+        // Once the client stops waiting, the operation carries on, so the error says how to find it.
+        let timed_out = || Error::OperationTimeout {
+            token: operation_token(&location),
+            location: location.to_string(),
+        };
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(Error::Timeout);
+                return Err(timed_out());
             }
-            let body = self
+            let body = match self
                 .poll(&location, remaining.min(POLL_TIMEOUT), max_retries)
-                .await?;
+                .await
+            {
+                Err(Error::Timeout) => return Err(timed_out()),
+                result => result?,
+            };
             match decode::<Operation>(&body)? {
                 Operation::Running {} => {}
                 Operation::Finished {
@@ -135,6 +144,42 @@ fn responded_async(response: &Response) -> bool {
             .get("preference-applied")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case(RESPOND_ASYNC))
+}
+
+/// The operation's token: the last segment of the URL to poll for it, like `tpuf-job-1` in
+/// `/v1/namespaces/ns/operations/tpuf-job-1`. It's percent-decoded, since methods taking a token, like
+/// `Namespace::poll_copy_from`, encode it themselves.
+fn operation_token(location: &Url) -> String {
+    let segment = location
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
+    percent_decode(segment)
+}
+
+/// Decodes `%XX` escapes in a URL path segment, leaving malformed ones as they are.
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            None => {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// The URL to poll for the operation, which must have the same origin as the request so that the API key isn't
@@ -364,6 +409,27 @@ mod tests {
         });
         let err = client.execute::<Value>(request).await.unwrap_err();
         assert!(err.is_timeout(), "{err:?}");
+        // The error has what's needed to check on the operation, which carries on.
+        let Error::OperationTimeout { token, location } = err else {
+            panic!("expected an operation timeout, got {err:?}");
+        };
+        assert_eq!(token, "tpuf-job-1");
+        assert_eq!(location, format!("{}{OPERATION}", server.uri()));
+    }
+
+    #[test]
+    fn percent_decodes_operation_tokens() {
+        let token = |location: &str| operation_token(&Url::parse(location).unwrap());
+        assert_eq!(
+            token("https://api.test/v1/namespaces/ns/operations/tpuf-job-1"),
+            "tpuf-job-1"
+        );
+        assert_eq!(
+            token("https://api.test/v1/namespaces/ns/operations/a%2Fb%20c"),
+            "a/b c"
+        );
+        // Malformed escapes are left as they are.
+        assert_eq!(token("https://api.test/operations/50%25%zz%"), "50%%zz%");
     }
 
     #[tokio::test]
