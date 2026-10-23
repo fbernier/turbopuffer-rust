@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::Instant;
 
-use super::{ApiRequest, decode, retry_after, should_retry};
+use super::{ApiRequest, decode, is_retryable_reqwest_error, retry_after, should_retry};
 use crate::client::Client;
 use crate::error::{ApiError, Error, Result};
 use crate::observer::Observation;
@@ -163,9 +163,7 @@ impl Client {
                     retry_after(response.headers())
                 }
                 Err(err) => {
-                    if attempt >= max_retries
-                        || !(err.is_timeout() || err.is_connect() || err.is_request())
-                    {
+                    if attempt >= max_retries || !is_retryable_reqwest_error(&err) {
                         return Err(Error::from_reqwest(err));
                     }
                     None
