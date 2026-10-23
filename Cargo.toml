@@ -21,6 +21,7 @@ rustls = ["reqwest/rustls"]
 native-tls = ["reqwest/native-tls"]
 
 [dependencies]
+base64 = "0.23"
 bytes = "1"
 flate2 = "1"
 futures-core = "0.3"

@@ -9,6 +9,8 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 
 use crate::resources::namespaces::WriteBody;
@@ -32,21 +34,21 @@ fn encode_upserts(
     rows: Option<&mut Vec<Row>>,
     columns: Option<&mut Columns>,
 ) {
-    let mut attributes = vec!["vector"];
-    attributes.extend(
-        schema
-            .into_iter()
-            .flatten()
-            .filter(|(_, schema)| is_vector(schema))
-            .map(|(name, _)| name.as_str()),
-    );
+    let ann_attributes: Vec<&str> = schema
+        .into_iter()
+        .flatten()
+        .filter(|(_, schema)| is_vector(schema))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    // `vector` normally has its own field on `Row` and `Columns`, but callers can also insert it into `extra`.
+    let is_vector_attribute = |name: &str| name == "vector" || ann_attributes.contains(&name);
 
     for row in rows.into_iter().flatten() {
         if let Some(vector) = &mut row.vector {
             encode_vector(vector);
         }
         for (name, value) in &mut row.extra {
-            if attributes.contains(&name.as_str()) {
+            if is_vector_attribute(name) {
                 encode_value(value);
             }
         }
@@ -59,7 +61,7 @@ fn encode_upserts(
             vectors.iter_mut().for_each(encode_vector);
         }
         for (name, values) in &mut columns.extra {
-            if attributes.contains(&name.as_str()) {
+            if is_vector_attribute(name) {
                 values.iter_mut().for_each(encode_value);
             }
         }
@@ -80,7 +82,11 @@ fn is_vector(schema: &AttributeSchema) -> bool {
 fn encode_vector(vector: &mut Vector) {
     if let Vector::Array(elements) = vector {
         if !elements.is_empty() {
-            *vector = Vector::String(encode(elements));
+            let bytes: Vec<u8> = elements
+                .iter()
+                .flat_map(|element| element.to_le_bytes())
+                .collect();
+            *vector = Vector::String(STANDARD.encode(bytes));
         }
     }
 }
@@ -93,38 +99,14 @@ fn encode_value(value: &mut Value) {
     if elements.is_empty() {
         return;
     }
-    let elements: Option<Vec<f32>> = elements
-        .iter()
-        .map(|element| element.as_f64().map(|element| element as f32))
-        .collect();
-    if let Some(elements) = elements {
-        *value = Value::String(encode(&elements));
+    let mut bytes = Vec::with_capacity(elements.len() * 4);
+    for element in elements.iter() {
+        let Some(element) = element.as_f64() else {
+            return;
+        };
+        bytes.extend_from_slice(&(element as f32).to_le_bytes());
     }
-}
-
-const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Encodes elements as standard, padded base64 of their little-endian bytes.
-fn encode(elements: &[f32]) -> String {
-    let bytes: Vec<u8> = elements
-        .iter()
-        .flat_map(|element| element.to_le_bytes())
-        .collect();
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let byte = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
-        let group = (byte(0) << 16) | (byte(1) << 8) | byte(2);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                encoded.push(char::from(
-                    ALPHABET[((group >> (18 - 6 * i)) & 63) as usize],
-                ));
-            } else {
-                encoded.push('=');
-            }
-        }
-    }
-    encoded
+    *value = Value::String(STANDARD.encode(bytes));
 }
 
 #[cfg(test)]
@@ -139,11 +121,15 @@ mod tests {
 
     #[test]
     fn encodes_base64() {
+        let encoded = |elements: &[f32]| {
+            let mut vector = Vector::Array(elements.to_vec());
+            encode_vector(&mut vector);
+            vector
+        };
         // Same as the Python SDK's `b64encode_vector`.
-        assert_eq!(encode(&[0.5, -1.25, 3.0]), "AAAAPwAAoL8AAEBA");
-        assert_eq!(encode(&[1.0]), "AACAPw==");
-        assert_eq!(encode(&[1.0, 2.0]), "AACAPwAAAEA=");
-        assert_eq!(encode(&[]), "");
+        assert_eq!(encoded(&[0.5, -1.25, 3.0]), "AAAAPwAAoL8AAEBA".into());
+        assert_eq!(encoded(&[1.0]), "AACAPw==".into());
+        assert_eq!(encoded(&[1.0, 2.0]), "AACAPwAAAEA=".into());
     }
 
     #[test]
@@ -173,7 +159,9 @@ mod tests {
             Row::new(2)
                 .vector(Vec::<f32>::new())
                 .insert("image", Value::Null),
-            Row::new(3).vector("AACAPwAAAEA="),
+            Row::new(3)
+                .vector("AACAPwAAAEA=")
+                .insert("image", json!([1.0, "x"])),
         ];
         encode_upserts(Some(&schema), Some(&mut rows), None);
 
@@ -189,7 +177,7 @@ mod tests {
                     "title": "Overnight oats",
                 },
                 { "id": 2, "vector": [], "image": null },
-                { "id": 3, "vector": "AACAPwAAAEA=" },
+                { "id": 3, "vector": "AACAPwAAAEA=", "image": [1.0, "x"] },
             ])
         );
     }
